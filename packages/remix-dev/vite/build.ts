@@ -1,7 +1,14 @@
 import type * as Vite from "vite";
+import path from "node:path";
+import fse from "fs-extra";
 import colors from "picocolors";
 
-import type { ResolvedRemixVitePluginConfig } from "./plugin";
+import type {
+  ResolvedRemixVitePluginConfig,
+  ServerBuildConfig,
+} from "./plugin";
+import type { ConfigRoute, RouteManifest } from "../config/routes";
+import invariant from "../invariant";
 
 async function extractRemixPluginConfig({
   configFile,
@@ -11,7 +18,7 @@ async function extractRemixPluginConfig({
   configFile?: string;
   mode?: string;
   root: string;
-}): Promise<ResolvedRemixVitePluginConfig> {
+}) {
   let vite = await import("vite");
 
   // Leverage the Vite config as a way to configure the entire multi-step build
@@ -29,7 +36,88 @@ async function extractRemixPluginConfig({
     process.exit(1);
   }
 
-  return pluginConfig;
+  return { pluginConfig, viteConfig };
+}
+
+function getLeafRoutes(routes: RouteManifest): ConfigRoute[] {
+  let parentIds = new Set<string>();
+  for (let id in routes) {
+    let { parentId } = routes[id];
+    if (typeof parentId === "string") {
+      parentIds.add(parentId);
+    }
+  }
+
+  let leafRoutes = [];
+  for (let id in routes) {
+    if (!parentIds.has(id)) {
+      leafRoutes.push(routes[id]);
+    }
+  }
+
+  return leafRoutes;
+}
+
+function getRouteMatches(routes: RouteManifest, routeId: string) {
+  let result: ConfigRoute[] = [];
+  let currentRouteId: string | undefined = routeId;
+
+  while (currentRouteId) {
+    invariant(routes[currentRouteId], `Missing route for ${currentRouteId}`);
+    result.push(routes[currentRouteId]);
+    currentRouteId = routes[currentRouteId].parentId;
+  }
+
+  return result.reverse();
+}
+
+function getServerBundles({
+  routes,
+  serverBuildDirectory,
+  serverBundleDirectory: getServerBundleDirectory,
+}: ResolvedRemixVitePluginConfig): ServerBuildConfig[] {
+  if (!getServerBundleDirectory) {
+    return [{ routes, serverBuildDirectory }];
+  }
+
+  let serverBundles = new Map<string, ServerBuildConfig>();
+
+  for (let route of getLeafRoutes(routes)) {
+    let matches = getRouteMatches(routes, route.id);
+
+    let serverBundleDirectory = path.join(
+      serverBuildDirectory,
+      getServerBundleDirectory({ route, matches })
+    );
+
+    let serverBuildConfig = serverBundles.get(serverBundleDirectory);
+    if (!serverBuildConfig) {
+      serverBuildConfig = {
+        routes: {},
+        serverBuildDirectory: serverBundleDirectory,
+      };
+      serverBundles.set(serverBundleDirectory, serverBuildConfig);
+    }
+    for (let match of matches) {
+      serverBuildConfig.routes[match.id] = match;
+    }
+  }
+
+  return Array.from(serverBundles.values());
+}
+
+async function cleanServerBuildDirectory(
+  viteConfig: Vite.ResolvedConfig,
+  { rootDirectory, serverBuildDirectory }: ResolvedRemixVitePluginConfig
+) {
+  let isWithinRoot = () => {
+    let relativePath = path.relative(rootDirectory, serverBuildDirectory);
+    return !relativePath.startsWith("..") && !path.isAbsolute(relativePath);
+  };
+
+  if (viteConfig.build.emptyOutDir ?? isWithinRoot()) {
+    await fse.remove(serverBuildDirectory);
+  }
 }
 
 export interface ViteBuildOptions {
@@ -56,10 +144,7 @@ export async function build(
     mode,
   }: ViteBuildOptions
 ) {
-  // For now we just use this function to validate that the Vite config is
-  // targeting Remix, but in the future the return value can be used to
-  // configure the entire multi-step build process.
-  await extractRemixPluginConfig({
+  let { pluginConfig, viteConfig } = await extractRemixPluginConfig({
     configFile,
     mode,
     root,
@@ -67,7 +152,8 @@ export async function build(
 
   let vite = await import("vite");
 
-  async function viteBuild({ ssr }: { ssr: boolean }) {
+  async function viteBuild(serverBuildConfig?: ServerBuildConfig) {
+    let ssr = Boolean(serverBuildConfig);
     await vite.build({
       root,
       mode,
@@ -76,9 +162,22 @@ export async function build(
       optimizeDeps: { force },
       clearScreen,
       logLevel,
+      ...(serverBuildConfig
+        ? { __remixServerBuildConfig: serverBuildConfig }
+        : {}),
     });
   }
 
-  await viteBuild({ ssr: false });
-  await viteBuild({ ssr: true });
+  // Since we're running multiple Vite server builds with different output
+  // directories based on your route config, we need to clean the root server
+  // build directory ourselves rather than relying on Vite to do it, otherwise
+  // you can end up with stale server bundles in your build output
+  await cleanServerBuildDirectory(viteConfig, pluginConfig);
+
+  // Run the Vite client build first
+  await viteBuild();
+
+  // Then run Vite SSR builds in parallel
+  let serverBundles = getServerBundles(pluginConfig);
+  await Promise.all(serverBundles.map(viteBuild));
 }
